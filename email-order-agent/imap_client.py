@@ -156,6 +156,65 @@ class IMAPClient:
 
         return pdf_attachments
 
+    def _get_email_body(self, msg) -> str:
+        """
+        Extract the text body from email message
+
+        Returns:
+            String with email body text (plain text or HTML converted to text)
+        """
+        body = ""
+
+        try:
+            # If email is multipart (has multiple parts like text, html, attachments)
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+
+                    # Skip attachments
+                    if "attachment" in content_disposition:
+                        continue
+
+                    # Get text/plain or text/html
+                    if content_type == "text/plain":
+                        try:
+                            body = part.get_payload(decode=True).decode(errors='ignore')
+                            break  # Prefer plain text
+                        except:
+                            continue
+                    elif content_type == "text/html" and not body:
+                        try:
+                            # Store HTML as fallback
+                            body = part.get_payload(decode=True).decode(errors='ignore')
+                        except:
+                            continue
+            else:
+                # Email is not multipart, get the payload directly
+                try:
+                    body = msg.get_payload(decode=True).decode(errors='ignore')
+                except:
+                    body = ""
+
+            # Clean up body - remove excessive whitespace and HTML tags if present
+            if body:
+                # Basic HTML tag removal if HTML body
+                if "<html" in body.lower() or "<body" in body.lower():
+                    import re
+                    body = re.sub(r'<[^>]+>', '', body)  # Remove HTML tags
+                    body = re.sub(r'&nbsp;', ' ', body)  # Replace &nbsp;
+                    body = re.sub(r'&[a-z]+;', '', body)  # Remove other HTML entities
+
+                # Clean excessive whitespace
+                lines = [line.strip() for line in body.split('\n')]
+                body = '\n'.join(line for line in lines if line)
+
+            return body.strip()
+
+        except Exception as e:
+            logger.error(f"Error extracting email body: {str(e)}")
+            return ""
+
     def check_emails(self):
         """
         Check inbox for new emails from monitored clients
@@ -245,11 +304,35 @@ class IMAPClient:
             logger.info(f"Processing NEW email: '{subject}' from {sender_email}")
             logger.info(f"Message-ID: {message_id[:80]}")
 
+            # Extract email body for analysis
+            email_body = self._get_email_body(msg)
+            if email_body:
+                logger.info(f"Extracted email body ({len(email_body)} characters)")
+            else:
+                logger.warning("Could not extract email body")
+
             # Get PDF attachments FIRST before marking as processed
             pdf_attachments = self._get_pdf_attachments(msg)
 
             if not pdf_attachments:
                 logger.info(f"No PDF attachments found in email from {sender_email}")
+
+                # If no PDFs but we have email body, analyze it
+                if email_body:
+                    logger.info("Analyzing email body without PDF...")
+                    email_analysis = self.claude_analyzer.analyze_email_content(
+                        email_body, sender_email, subject
+                    )
+                    if email_analysis:
+                        # Send notification with email analysis
+                        success = self._send_email_only_notification(
+                            email_analysis, sender_email, subject, date
+                        )
+                        if success:
+                            self._save_processed_email(message_id)
+                            logger.info(f"Email marked as processed: {message_id[:50]}")
+                            return
+
                 # Mark as processed even without PDFs to avoid re-checking emails without attachments
                 self._save_processed_email(message_id)
                 return
@@ -267,18 +350,30 @@ class IMAPClient:
                     else:
                         readable_pdfs.append(analysis_result)
 
+            # Analyze email body if available
+            email_analysis = None
+            if email_body:
+                logger.info("Analyzing email body content...")
+                email_analysis = self.claude_analyzer.analyze_email_content(
+                    email_body, sender_email, subject
+                )
+
             # Send notifications
             notification_sent = False
 
-            # Send notification for readable PDFs (normal analysis)
+            # Send notification for readable PDFs (normal analysis) + email context
             if readable_pdfs:
-                success = self._send_grouped_notification(readable_pdfs, sender_email, subject, date)
+                success = self._send_grouped_notification(
+                    readable_pdfs, sender_email, subject, date, email_analysis
+                )
                 if success:
                     notification_sent = True
 
-            # Send notification for unreadable PDFs (scanned images)
+            # Send notification for unreadable PDFs (scanned images) + email analysis
             if unreadable_pdfs:
-                success = self._send_unreadable_pdf_notification(unreadable_pdfs, sender_email, subject, date)
+                success = self._send_unreadable_pdf_notification(
+                    unreadable_pdfs, sender_email, subject, date, email_analysis
+                )
                 if success:
                     notification_sent = True
 
@@ -340,9 +435,17 @@ class IMAPClient:
             return None
 
     def _send_grouped_notification(
-        self, pdf_analyses: List[Dict], sender_email: str, subject: str, date: str
+        self, pdf_analyses: List[Dict], sender_email: str, subject: str, date: str,
+        email_analysis: Optional[Dict] = None
     ) -> bool:
         """Send a single notification for all PDFs in an email
+
+        Args:
+            pdf_analyses: List of PDF analysis results
+            sender_email: Sender email address
+            subject: Email subject
+            date: Email date
+            email_analysis: Optional email body analysis
 
         Returns:
             bool: True if notification was sent successfully, False otherwise
@@ -369,6 +472,12 @@ class IMAPClient:
 
                 if i < num_pdfs:
                     message_parts.append(f"\n{'-'*40}")
+
+            # Add email analysis if available
+            if email_analysis:
+                message_parts.append(f"\n\n{'='*40}")
+                message_parts.append(f"\n📧 CONTEXTO DEL CORREO:\n")
+                message_parts.append(self._format_email_analysis(email_analysis))
 
             # Add email metadata at the end
             message_parts.append(f"\n\n📧 Asunto: {subject[:100]}")
@@ -414,7 +523,8 @@ class IMAPClient:
             return False
 
     def _send_unreadable_pdf_notification(
-        self, unreadable_pdfs: List[Dict], sender_email: str, subject: str, date: str
+        self, unreadable_pdfs: List[Dict], sender_email: str, subject: str, date: str,
+        email_analysis: Optional[Dict] = None
     ) -> bool:
         """Send notification for PDFs that couldn't be read (scanned images)
 
@@ -423,6 +533,7 @@ class IMAPClient:
             sender_email: Email address of sender
             subject: Email subject
             date: Email date
+            email_analysis: Optional email body analysis
 
         Returns:
             bool: True if notification was sent successfully, False otherwise
@@ -450,9 +561,17 @@ class IMAPClient:
                 else:
                     message_parts.append(f"📄 Archivo: {filename}")
 
+            # Add email analysis if available (VERY useful when PDF is unreadable)
+            if email_analysis:
+                message_parts.append(f"\n\n{'='*40}")
+                message_parts.append(f"\n📧 ANÁLISIS DEL CORREO:\n")
+                message_parts.append(self._format_email_analysis(email_analysis))
+                message_parts.append("\n💡 Como el PDF no se pudo leer, revísalo manualmente.")
+            else:
+                message_parts.append("\n💡 Revisa el correo manualmente para ver el contenido del PDF.")
+
             # Add email subject
             message_parts.append(f"\n\n📧 Asunto: {subject[:100]}")
-            message_parts.append("\n💡 Revisa el correo manualmente para ver el contenido del PDF.")
 
             # Join all parts
             full_message = "\n".join(message_parts)
@@ -477,6 +596,136 @@ class IMAPClient:
 
         except Exception as e:
             logger.error(f"Error sending unreadable PDF notification: {str(e)}")
+            return False
+
+    def _format_email_analysis(self, email_analysis: Dict) -> str:
+        """Format email analysis for notification message
+
+        Args:
+            email_analysis: Analysis dictionary from Claude
+
+        Returns:
+            Formatted string with email analysis
+        """
+        parts = []
+
+        # Message type
+        tipo = email_analysis.get('tipo_mensaje', 'otro')
+        tipo_emoji = {
+            'orden_compra': '📝',
+            'cotizacion': '💰',
+            'consulta': '❓',
+            'reclamo': '⚠️',
+            'otro': '📧'
+        }
+        parts.append(f"{tipo_emoji.get(tipo, '📧')} Tipo: {tipo.replace('_', ' ').title()}")
+
+        # Products mentioned
+        productos = email_analysis.get('productos_mencionados', [])
+        if productos:
+            parts.append("\n📦 Productos solicitados:")
+            for prod in productos:
+                nombre = prod.get('nombre', 'N/A')
+                cantidad = prod.get('cantidad')
+                espec = prod.get('especificaciones')
+
+                prod_line = f"  • {nombre}"
+                if cantidad:
+                    prod_line += f" - {cantidad}"
+                if espec:
+                    prod_line += f"\n    {espec}"
+                parts.append(prod_line)
+
+        # Order number
+        orden = email_analysis.get('numero_orden')
+        if orden:
+            parts.append(f"\n📄 OC#: {orden}")
+
+        # Delivery date
+        fecha = email_analysis.get('fecha_entrega')
+        if fecha:
+            parts.append(f"📅 Entrega: {fecha}")
+
+        # Urgency
+        urgencia = email_analysis.get('urgencia', 'normal')
+        if urgencia == 'urgente':
+            parts.append(f"🔴 URGENTE")
+        elif urgencia == 'baja':
+            parts.append(f"🟢 Prioridad baja")
+
+        # Important notes
+        notas = email_analysis.get('notas_importantes')
+        if notas:
+            parts.append(f"\n💡 Notas: {notas}")
+
+        # Response needed
+        if email_analysis.get('requiere_respuesta'):
+            parts.append(f"\n⚡ Requiere respuesta")
+
+        return "\n".join(parts)
+
+    def _send_email_only_notification(
+        self, email_analysis: Dict, sender_email: str, subject: str, date: str
+    ) -> bool:
+        """Send notification for emails without PDF attachments
+
+        Args:
+            email_analysis: Email body analysis from Claude
+            sender_email: Email address of sender
+            subject: Email subject
+            date: Email date
+
+        Returns:
+            bool: True if notification was sent successfully, False otherwise
+        """
+        try:
+            # Build message
+            tipo = email_analysis.get('tipo_mensaje', 'otro')
+            tipo_emoji = {
+                'orden_compra': '📝',
+                'cotizacion': '💰',
+                'consulta': '❓',
+                'reclamo': '⚠️',
+                'otro': '📧'
+            }
+
+            message_parts = [
+                f"{tipo_emoji.get(tipo, '📧')} NUEVO CORREO DE CLIENTE",
+                f"\n📧 De: {sender_email}",
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                f"\n{'='*40}\n"
+            ]
+
+            # Add email analysis
+            message_parts.append("📧 ANÁLISIS DEL CORREO:\n")
+            message_parts.append(self._format_email_analysis(email_analysis))
+
+            # Add email subject
+            message_parts.append(f"\n\n📧 Asunto: {subject[:100]}")
+
+            # Join all parts
+            full_message = "\n".join(message_parts)
+
+            # Send notification
+            logger.info(f"Sending notification for email without PDF from {sender_email}")
+
+            if config.NOTIFICATION_PROVIDER == "telegram":
+                success = self.notifier.send_message(full_message)
+            elif config.NOTIFICATION_PROVIDER == "twilio":
+                success = self.notifier.send_message(full_message)
+            else:
+                logger.error(f"Unknown notification provider: {config.NOTIFICATION_PROVIDER}")
+                success = False
+
+            if success:
+                logger.info(f"Successfully sent email-only notification")
+                return True
+            else:
+                logger.error(f"Failed to send email-only notification")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error sending email-only notification: {str(e)}")
             return False
 
     def run_monitoring_cycle(self):

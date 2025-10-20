@@ -202,3 +202,90 @@ Respond with ONLY valid JSON, no additional text."""
         )
 
         return "\n".join(message_parts)
+
+    def analyze_email_content(
+        self, email_body: str, sender_email: str, subject: str
+    ) -> Optional[Dict]:
+        """
+        Analyze email body content to extract relevant business information
+
+        Args:
+            email_body: Text content of the email
+            sender_email: Email address of sender
+            subject: Email subject line
+
+        Returns:
+            Dictionary with extracted information or None if analysis fails
+        """
+        try:
+            # Limit text to first 2000 characters to optimize costs
+            text_sample = email_body[:2000] if len(email_body) > 2000 else email_body
+
+            logger.info(f"Analyzing email content from {sender_email}")
+            logger.debug(f"Email body length: {len(text_sample)} characters")
+
+            prompt = f"""Analiza el siguiente correo electrónico de un cliente y extrae información relevante de negocio.
+
+Remitente: {sender_email}
+Asunto: {subject}
+
+Contenido del correo:
+{text_sample}
+
+Extrae la información más importante y responde SOLO con JSON válido:
+
+{{
+    "tipo_mensaje": "orden_compra/cotizacion/consulta/reclamo/otro",
+    "productos_mencionados": [
+        {{
+            "nombre": "nombre del producto",
+            "cantidad": "cantidad con unidades o null",
+            "especificaciones": "detalles adicionales o null"
+        }}
+    ],
+    "fecha_entrega": "fecha solicitada o null",
+    "numero_orden": "número de OC mencionado o null",
+    "urgencia": "urgente/normal/baja",
+    "notas_importantes": "resumen de puntos clave del correo",
+    "requiere_respuesta": true/false,
+    "confianza": "high/medium/low"
+}}
+
+IMPORTANTE: Extrae solo información explícitamente mencionada en el correo.
+Responde con SOLO JSON válido, sin texto adicional."""
+
+            # Call Claude API
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            # Extract response
+            response_text = message.content[0].text
+
+            # Log token usage
+            input_tokens = message.usage.input_tokens
+            output_tokens = message.usage.output_tokens
+            logger.info(
+                f"Email analysis completed. Tokens: {input_tokens} input, "
+                f"{output_tokens} output"
+            )
+
+            # Parse JSON response
+            analysis_result = self._parse_claude_response(response_text)
+
+            if analysis_result:
+                analysis_result["sender_email"] = sender_email
+                analysis_result["subject"] = subject
+                analysis_result["tokens_used"] = input_tokens + output_tokens
+
+                logger.info(
+                    f"Email analysis complete. Type: {analysis_result.get('tipo_mensaje')}"
+                )
+
+            return analysis_result
+
+        except Exception as e:
+            logger.error(f"Error analyzing email with Claude: {str(e)}")
+            return None
