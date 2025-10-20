@@ -91,6 +91,44 @@ python3 reopen_whatsapp_window.py
 
 Tu agente ahora está corriendo 24/7 en la nube.
 
+---
+
+## 🔄 Actualizar el Código cuando hagas Cambios
+
+### En tu Mac (desarrollo local):
+
+```bash
+cd /Users/amauryperezverdejo/Desktop/agentes/mensajeriaPO/email-order-agent
+
+# 1. Haces tus modificaciones en cualquier archivo .py
+
+# 2. Subes los cambios a GitHub
+git add .
+git commit -m "Descripción de tus cambios"
+git push origin main
+```
+
+### En la VM (aplicar cambios):
+
+```bash
+ssh -i ~/.ssh/oracle-vm-key.pem ubuntu@<TU_IP>
+cd ~/apps/email-order-agent
+
+# ¡Un solo comando actualiza TODO!
+./update.sh
+```
+
+**El script `update.sh` hace automáticamente:**
+- ✅ Detiene el agente si está corriendo
+- ✅ Descarga los cambios desde GitHub
+- ✅ Actualiza todos los archivos Python
+- ✅ Reinicia el agente en tmux
+- ✅ Muestra resumen de lo actualizado
+
+**Eso es todo.** No necesitas detener manualmente ni reiniciar nada.
+
+---
+
 ### Para reconectar más tarde:
 
 ```bash
@@ -105,7 +143,7 @@ ssh -i ~/.ssh/oracle-vm-key.pem ubuntu@<TU_IP>
 tail -f ~/apps/email-order-agent/logs/email_monitor.log
 ```
 
-### Para detener (si es necesario):
+### Para detener manualmente (si es necesario):
 
 ```bash
 ssh -i ~/.ssh/oracle-vm-key.pem ubuntu@<TU_IP>
