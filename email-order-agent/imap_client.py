@@ -245,14 +245,13 @@ class IMAPClient:
             logger.info(f"Processing NEW email: '{subject}' from {sender_email}")
             logger.info(f"Message-ID: {message_id[:80]}")
 
-            # Mark email as processed FIRST to prevent reprocessing even if errors occur
-            self._save_processed_email(message_id)
-
-            # Get PDF attachments
+            # Get PDF attachments FIRST before marking as processed
             pdf_attachments = self._get_pdf_attachments(msg)
 
             if not pdf_attachments:
                 logger.info(f"No PDF attachments found in email from {sender_email}")
+                # Mark as processed even without PDFs to avoid re-checking emails without attachments
+                self._save_processed_email(message_id)
                 return
 
             logger.info(f"Found {len(pdf_attachments)} PDF(s) in email")
@@ -264,9 +263,17 @@ class IMAPClient:
                 if analysis_result:
                     pdf_analyses.append(analysis_result)
 
-            # Send single WhatsApp notification with all PDFs
+            # Send single notification with all PDFs
+            notification_sent = False
             if pdf_analyses:
-                self._send_grouped_notification(pdf_analyses, sender_email, subject, date)
+                notification_sent = self._send_grouped_notification(pdf_analyses, sender_email, subject, date)
+
+            # Mark email as processed ONLY after successful notification or if no valid PDFs were found
+            if notification_sent or len(pdf_analyses) == 0:
+                self._save_processed_email(message_id)
+                logger.info(f"Email marked as processed: {message_id[:50]}")
+            else:
+                logger.warning(f"Email NOT marked as processed due to processing failure: {message_id[:50]}")
 
             # Mark as read in inbox (optional)
             # mail.store(email_id, '+FLAGS', '\\Seen')
@@ -308,8 +315,12 @@ class IMAPClient:
 
     def _send_grouped_notification(
         self, pdf_analyses: List[Dict], sender_email: str, subject: str, date: str
-    ):
-        """Send a single WhatsApp notification for all PDFs in an email"""
+    ) -> bool:
+        """Send a single notification for all PDFs in an email
+
+        Returns:
+            bool: True if notification was sent successfully, False otherwise
+        """
         try:
             # Build header
             num_pdfs = len(pdf_analyses)
@@ -367,11 +378,14 @@ class IMAPClient:
 
             if success:
                 logger.info(f"Successfully sent notification for {num_pdfs} PDF(s)")
+                return True
             else:
                 logger.error(f"Failed to send notification")
+                return False
 
         except Exception as e:
             logger.error(f"Error sending grouped notification: {str(e)}")
+            return False
 
     def run_monitoring_cycle(self):
         """Run one complete monitoring cycle"""
