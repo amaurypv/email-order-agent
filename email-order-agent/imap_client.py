@@ -256,20 +256,35 @@ class IMAPClient:
 
             logger.info(f"Found {len(pdf_attachments)} PDF(s) in email")
 
-            # Process all PDFs and collect results
-            pdf_analyses = []
+            # Process all PDFs and separate readable from unreadable
+            readable_pdfs = []
+            unreadable_pdfs = []
             for pdf_info in pdf_attachments:
                 analysis_result = self._analyze_pdf(pdf_info, sender_email)
                 if analysis_result:
-                    pdf_analyses.append(analysis_result)
+                    if analysis_result.get("unreadable"):
+                        unreadable_pdfs.append(analysis_result)
+                    else:
+                        readable_pdfs.append(analysis_result)
 
-            # Send single notification with all PDFs
+            # Send notifications
             notification_sent = False
-            if pdf_analyses:
-                notification_sent = self._send_grouped_notification(pdf_analyses, sender_email, subject, date)
+
+            # Send notification for readable PDFs (normal analysis)
+            if readable_pdfs:
+                success = self._send_grouped_notification(readable_pdfs, sender_email, subject, date)
+                if success:
+                    notification_sent = True
+
+            # Send notification for unreadable PDFs (scanned images)
+            if unreadable_pdfs:
+                success = self._send_unreadable_pdf_notification(unreadable_pdfs, sender_email, subject, date)
+                if success:
+                    notification_sent = True
 
             # Mark email as processed ONLY after successful notification or if no valid PDFs were found
-            if notification_sent or len(pdf_analyses) == 0:
+            total_processed = len(readable_pdfs) + len(unreadable_pdfs)
+            if notification_sent or total_processed == 0:
                 self._save_processed_email(message_id)
                 logger.info(f"Email marked as processed: {message_id[:50]}")
             else:
@@ -282,7 +297,13 @@ class IMAPClient:
             logger.error(f"Error processing email: {str(e)}")
 
     def _analyze_pdf(self, pdf_info: Dict, sender_email: str) -> Optional[Dict]:
-        """Analyze a single PDF and return the analysis result"""
+        """Analyze a single PDF and return the analysis result
+
+        Returns:
+            Dict with analysis if successful
+            Dict with 'unreadable': True if PDF has no extractable text
+            None if processing error occurred
+        """
         try:
             filename = pdf_info["filename"]
             pdf_data = pdf_info["data"]
@@ -293,8 +314,13 @@ class IMAPClient:
             pdf_text = self.pdf_processor.extract_text(pdf_data, filename)
 
             if not pdf_text:
-                logger.warning(f"Could not extract text from {filename}")
-                return None
+                logger.warning(f"Could not extract text from {filename} - likely scanned image")
+                # Return special marker for unreadable PDFs
+                return {
+                    "unreadable": True,
+                    "filename": filename,
+                    "sender_email": sender_email
+                }
 
             # Step 2: Analyze with Claude
             logger.info(f"Analyzing {filename} with Claude...")
@@ -385,6 +411,72 @@ class IMAPClient:
 
         except Exception as e:
             logger.error(f"Error sending grouped notification: {str(e)}")
+            return False
+
+    def _send_unreadable_pdf_notification(
+        self, unreadable_pdfs: List[Dict], sender_email: str, subject: str, date: str
+    ) -> bool:
+        """Send notification for PDFs that couldn't be read (scanned images)
+
+        Args:
+            unreadable_pdfs: List of dicts with 'filename' and 'sender_email'
+            sender_email: Email address of sender
+            subject: Email subject
+            date: Email date
+
+        Returns:
+            bool: True if notification was sent successfully, False otherwise
+        """
+        try:
+            num_pdfs = len(unreadable_pdfs)
+
+            # Build message
+            message_parts = [
+                f"{'⚠️ NUEVA ORDEN DE COMPRA (PDF NO LEGIBLE)' if num_pdfs == 1 else '⚠️ NUEVAS ÓRDENES DE COMPRA (PDFs NO LEGIBLES)'}",
+                f"\n📧 De: {sender_email}",
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                f"📎 {num_pdfs} PDF(s) adjunto(s)",
+                f"\n{'='*40}\n"
+            ]
+
+            # Add info about each unreadable PDF
+            message_parts.append("⚠️ No se pudo extraer texto del PDF")
+            message_parts.append("Es probable que sea una imagen escaneada.\n")
+
+            for i, pdf_info in enumerate(unreadable_pdfs, 1):
+                filename = pdf_info.get('filename', 'Unknown')
+                if num_pdfs > 1:
+                    message_parts.append(f"\n📄 PDF #{i}: {filename}")
+                else:
+                    message_parts.append(f"📄 Archivo: {filename}")
+
+            # Add email subject
+            message_parts.append(f"\n\n📧 Asunto: {subject[:100]}")
+            message_parts.append("\n💡 Revisa el correo manualmente para ver el contenido del PDF.")
+
+            # Join all parts
+            full_message = "\n".join(message_parts)
+
+            # Send notification
+            logger.info(f"Sending notification for {num_pdfs} unreadable PDF(s)...")
+
+            if config.NOTIFICATION_PROVIDER == "telegram":
+                success = self.notifier.send_message(full_message)
+            elif config.NOTIFICATION_PROVIDER == "twilio":
+                success = self.notifier.send_message(full_message)
+            else:
+                logger.error(f"Unknown notification provider: {config.NOTIFICATION_PROVIDER}")
+                success = False
+
+            if success:
+                logger.info(f"Successfully sent unreadable PDF notification for {num_pdfs} PDF(s)")
+                return True
+            else:
+                logger.error(f"Failed to send unreadable PDF notification")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error sending unreadable PDF notification: {str(e)}")
             return False
 
     def run_monitoring_cycle(self):
